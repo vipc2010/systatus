@@ -1,0 +1,6 @@
+[Unit]
+Description=systatus 顶栏监控扩展守护
+
+[Service]
+Type=oneshot
+ExecStart=%h/systatus/watchdog.sh

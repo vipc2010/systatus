@@ -1,0 +1,9 @@
+[Unit]
+Description=每 2 分钟检查一次 systatus 扩展状态
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

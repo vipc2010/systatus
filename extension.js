@@ -265,7 +265,10 @@ class Indicator extends PanelMenuButton {
 export default class SystatusExtension extends Extension {
     enable() {
         this._indicator = new Indicator();
-        Main.panel.addToStatusArea(this.uuid, this._indicator);
+        // 挂到面板左侧（Activities 之后），避开居中的日期时间。
+        // 必须走 addToStatusArea：它插入的是 indicator.container，
+        // 直接 add_child(button) 会宽度塌陷、什么都不显示。
+        Main.panel.addToStatusArea(this.uuid, this._indicator, 1, 'left');
     }
 
     disable() {

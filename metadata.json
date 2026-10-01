@@ -2,5 +2,5 @@
   "uuid": "systatus@fanliaowu.local",
   "name": "System Status Monitor",
   "description": "顶栏显示 CPU / GPU / 内存 / 功耗使用情况",
-  "shell-version": ["45", "46"]
+  "shell-version": ["45", "46", "50"]
 }

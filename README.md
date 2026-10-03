@@ -112,6 +112,8 @@ sudo rm /etc/tmpfiles.d/systatus-powercap.conf
 - 端口面板背景透明度：`PORTS_BG_OPACITY`（0 全透明 ~ 255 不透明，默认 140）
 - 端口面板宽度：`PORTS_WIDTH`（px，默认 280）
 
+**注意**：修改 `extension.js` 代码后，`gnome-extensions disable/enable` **不会**重新加载代码（Shell 只在会话启动时 `import` 一次扩展模块，且 GJS 按路径缓存 ES 模块），必须**注销并重新登录**（Wayland 下无 `Alt+F2 r`）才能生效。
+
 ## 卸载
 
 ```bash

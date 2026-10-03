@@ -13,6 +13,7 @@ const REFRESH_SECONDS = 2;
 const NVIDIA_SMI = '/usr/bin/nvidia-smi';
 const RAPL_PKG = '/sys/class/powercap/intel-rapl:0/energy_uj';
 const RAPL_MAX = '/sys/class/powercap/intel-rapl:0/max_energy_range_uj';
+const PORTS_OPACITY = 150; // 端口指示器顶栏不透明度（0 全透明 ~ 255 不透明）
 
 const COLORS = {
     cpu: '#42a5f5',
@@ -20,6 +21,7 @@ const COLORS = {
     gpu: '#ffa726',
     vram: '#26c6da',
     pwr: '#ef5350',
+    ports: '#ab47bc',
 };
 
 function readText(path) {
@@ -41,6 +43,84 @@ function fmtW(v) {
 
 function fmtGb(mib) {
     return (mib / 1024).toFixed(1);
+}
+
+// 读取监听端口：TCP 只取 st=0A（LISTEN），UDP 取所有已绑定套接字。
+// 返回 [{proto: 'tcp'|'udp', port, inode}]
+function readListeningSockets() {
+    const sockets = [];
+    const sources = [
+        ['/proc/net/tcp', 'tcp', true],
+        ['/proc/net/tcp6', 'tcp', true],
+        ['/proc/net/udp', 'udp', false],
+        ['/proc/net/udp6', 'udp', false],
+    ];
+    for (const [path, proto, listenOnly] of sources) {
+        const txt = readText(path);
+        if (!txt)
+            continue;
+        const lines = txt.split('\n');
+        for (let i = 1; i < lines.length; i++) {
+            const f = lines[i].trim().split(/\s+/);
+            if (f.length < 10)
+                continue;
+            if (listenOnly && f[3] !== '0A')
+                continue;
+            const port = parseInt(f[1].split(':').pop(), 16);
+            if (port > 0)
+                sockets.push({ proto, port, inode: f[9] });
+        }
+    }
+    return sockets;
+}
+
+// 通过 /proc/<pid>/fd 的 socket:[inode] 符号链接反查进程名（仅当前用户可见的进程）。
+// 返回 Map<inode, comm>
+function findSocketOwners(inodes) {
+    const owners = new Map();
+    if (inodes.size === 0)
+        return owners;
+    const procEnum = GLib.file_enumerate_directory(GLib.file_new_for_path('/proc'), GLib.PRIORITY_DEFAULT, null);
+    if (!procEnum)
+        return owners;
+    outer:
+    while (true) {
+        const entry = procEnum.next_file(procEnum);
+        if (!entry)
+            break;
+        const pid = entry.get_name();
+        if (!/^\d+$/.test(pid))
+            continue;
+        const fdEnum = GLib.file_enumerate_directory(GLib.file_new_for_path(`/proc/${pid}/fd`), GLib.PRIORITY_DEFAULT, null);
+        if (!fdEnum)
+            continue;
+        while (true) {
+            const fdEntry = fdEnum.next_file(fdEnum);
+            if (!fdEntry)
+                break;
+            let target = null;
+            try {
+                target = Gio.File.new_for_path(`/proc/${pid}/fd/${fdEntry.get_name()}`).read_symlink();
+            } catch (e) {
+                continue;
+            }
+            if (!target || !target.startsWith('socket:['))
+                continue;
+            const inode = target.slice(8, -1);
+            if (inodes.has(inode) && !owners.has(inode)) {
+                const comm = readText(`/proc/${pid}/comm`);
+                owners.set(inode, comm ? comm.trim().split('\n')[0] : pid);
+                if (owners.size === inodes.size) {
+                    fdEnum.close();
+                    procEnum.close();
+                    break outer;
+                }
+            }
+        }
+        fdEnum.close();
+    }
+    procEnum.close();
+    return owners;
 }
 
 const Indicator = GObject.registerClass(
@@ -262,17 +342,104 @@ class Indicator extends PanelMenuButton {
     }
 });
 
+// 面板右侧的监听端口指示器：顶栏半透明显示端口数量，点击展开端口/进程列表。
+const PortsIndicator = GObject.registerClass(
+class PortsIndicator extends PanelMenuButton {
+    _init() {
+        super._init(0.0, '监听端口', false);
+
+        this._ports = [];
+        this._items = [];
+
+        const box = new St.BoxLayout({ style_class: 'panel-status-menu-box' });
+        const dot = new St.Label({ text: '● ', y_align: Clutter.ActorAlign.CENTER });
+        dot.set_style(`color: ${COLORS.ports};`);
+        this._label = new St.Label({ text: 'PORTS –', y_align: Clutter.ActorAlign.CENTER });
+        box.add_child(dot);
+        box.add_child(this._label);
+        box.set_opacity(PORTS_OPACITY);
+        this.add_child(box);
+
+        const itemParams = { reactive: false, can_focus: false };
+        this._header = new PopupMenuItem('', itemParams);
+        this._sep = new PopupSeparatorMenuItem();
+        this.menu.addMenuItem(this._sep);
+        this.menu.addMenuItem(this._header);
+
+        this._tickId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, REFRESH_SECONDS, () => {
+            this._tick();
+            return GLib.SOURCE_CONTINUE;
+        });
+        this._tick();
+    }
+
+    destroy() {
+        if (this._tickId) {
+            GLib.source_remove(this._tickId);
+            this._tickId = null;
+        }
+        super.destroy();
+    }
+
+    _tick() {
+        const sockets = readListeningSockets();
+        // 同一 proto:port 可能在 v4/v6 各出现一次，去重
+        const byKey = new Map();
+        for (const s of sockets) {
+            const key = `${s.proto}:${s.port}`;
+            if (!byKey.has(key))
+                byKey.set(key, s);
+        }
+        const inodes = new Set();
+        for (const s of byKey.values())
+            if (s.inode && s.inode !== '0')
+                inodes.add(s.inode);
+        const owners = findSocketOwners(inodes);
+        const list = [...byKey.values()].map(s => ({
+            proto: s.proto.toUpperCase(),
+            port: s.port,
+            name: s.inode && s.inode !== '0' ? owners.get(s.inode) : null,
+        }));
+        list.sort((a, b) => a.proto === b.proto ? a.port - b.port : (a.proto < b.proto ? -1 : 1));
+        this._ports = list;
+        this._render();
+    }
+
+    _render() {
+        const n = this._ports.length;
+        this._label.set_text(`PORTS ${n}`);
+        const visible = Math.min(n, 100);
+        while (this._items.length < visible)
+            this._items.push(new PopupMenuItem('', { reactive: false, can_focus: false }));
+        for (let i = 0; i < visible; i++) {
+            const p = this._ports[i];
+            this._items[i].label_actor.text = `${p.proto}　${p.port}${p.name ? `　${p.name}` : ''}`;
+        }
+        this._header.label_actor.text = n ? `PORTS　${n} 个监听端口` : 'PORTS　无监听端口';
+        this.menu.removeAll();
+        this.menu.addMenuItem(this._sep);
+        this.menu.addMenuItem(this._header);
+        for (let i = 0; i < visible; i++)
+            this.menu.addMenuItem(this._items[i]);
+    }
+});
+
 export default class SystatusExtension extends Extension {
     enable() {
         this._indicator = new Indicator();
+        this._portsIndicator = new PortsIndicator();
         // 挂到面板左侧（Activities 之后），避开居中的日期时间。
         // 必须走 addToStatusArea：它插入的是 indicator.container，
         // 直接 add_child(button) 会宽度塌陷、什么都不显示。
         Main.panel.addToStatusArea(this.uuid, this._indicator, 1, 'left');
+        // 端口指示器挂面板右侧，半透明显示。
+        Main.panel.addToStatusArea(this.uuid + '-ports', this._portsIndicator, 0, 'right');
     }
 
     disable() {
         this._indicator?.destroy();
         this._indicator = null;
+        this._portsIndicator?.destroy();
+        this._portsIndicator = null;
     }
 }

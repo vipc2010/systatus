@@ -1,16 +1,16 @@
 # systatus
 
-一个轻量的 GNOME 顶栏系统监控扩展，在状态栏实时显示 **CPU / RAM / VRAM / GPU / POWER** 五项指标，点击可展开详情菜单。
+一个轻量的 GNOME 顶栏系统监控扩展，在状态栏实时显示 **CPU / RAM / VRAM / GPU / POWER** 五项指标，点击可展开详情菜单；面板右侧另有半透明的**监听端口**指示器（`PORTS n`），点击展开端口与进程列表。
 
-A lightweight GNOME top-bar system monitor: CPU, RAM, VRAM, GPU utilization and power draw, with a click-to-expand detail menu.
+A lightweight GNOME top-bar system monitor: CPU, RAM, VRAM, GPU utilization and power draw, with a click-to-expand detail menu, plus a semi-transparent listening-ports indicator on the right side of the panel.
 
 ## 效果
 
 ```
-● CPU 11%  ● RAM 49%  ● VRAM 80%  ● GPU 5%  ● POWER 108.3W
+● CPU 11%  ● RAM 49%  ● VRAM 80%  ● GPU 5%  ● POWER 108.3W        ● PORTS 12
 ```
 
-点击顶栏区域展开详情：GPU 型号、显存绝对值（GB）、CPU 封装功耗与 GPU 功耗拆分。
+点击顶栏区域展开详情：GPU 型号、显存绝对值（GB）、CPU 封装功耗与 GPU 功耗拆分。点击右侧 `PORTS` 展开监听端口列表（协议、端口、进程名）。
 
 ## 数据来源
 
@@ -20,6 +20,7 @@ A lightweight GNOME top-bar system monitor: CPU, RAM, VRAM, GPU utilization and 
 | RAM | `/proc/meminfo` | `MemTotal - MemAvailable` |
 | GPU / VRAM | `nvidia-smi` | 异步子进程查询，不阻塞 Shell |
 | POWER | RAPL + `nvidia-smi` | CPU 封装功耗（`/sys/class/powercap`）+ GPU 功耗之和 |
+| 端口 | `/proc/net/{tcp,tcp6,udp,udp6}` | TCP 只取 LISTEN、UDP 取已绑定；inode 经 `/proc/*/fd` 反查进程名（仅当前用户可见的进程，root 进程只显示端口） |
 
 ## 环境要求
 
@@ -99,6 +100,7 @@ sudo rm /etc/tmpfiles.d/systatus-powercap.conf
 - 刷新间隔：`extension.js` 中 `REFRESH_SECONDS`（默认 2 秒）
 - 指标顺序与颜色：`_init()` 中的段落数组与 `COLORS`
 - 标签语言：`_render()` 中各 `set_text` 前缀
+- 端口指示器透明度：`PORTS_OPACITY`（0 全透明 ~ 255 不透明，默认 150）
 
 ## 卸载
 

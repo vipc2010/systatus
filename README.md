@@ -1,16 +1,25 @@
 # systatus
 
-一个轻量的 GNOME 顶栏系统监控扩展，在状态栏实时显示 **CPU / RAM / VRAM / GPU / POWER** 五项指标，点击可展开详情菜单；面板右侧另有半透明的**监听端口**指示器（`PORTS n`），点击展开端口与进程列表。
+一个轻量的 GNOME 顶栏系统监控扩展，在状态栏实时显示 **CPU / RAM / VRAM / GPU / POWER** 五项指标，点击可展开详情菜单；桌面右侧另有常驻的半透明**监听端口**面板，直接列出所有监听端口（协议、端口、进程名）。
 
-A lightweight GNOME top-bar system monitor: CPU, RAM, VRAM, GPU utilization and power draw, with a click-to-expand detail menu, plus a semi-transparent listening-ports indicator on the right side of the panel.
+A lightweight GNOME top-bar system monitor: CPU, RAM, VRAM, GPU utilization and power draw, with a click-to-expand detail menu, plus a persistent semi-transparent listening-ports panel on the right side of the desktop.
 
 ## 效果
 
 ```
-● CPU 11%  ● RAM 49%  ● VRAM 80%  ● GPU 5%  ● POWER 108.3W        ● PORTS 12
+顶栏左侧：● CPU 11%  ● RAM 49%  ● VRAM 80%  ● GPU 5%  ● POWER 108.3W
+
+桌面右侧（常驻半透明面板，窗口之下，不遮挡窗口）：
+┌────────────────────────────┐
+│ PORTS　38 个监听端口        │
+│ TCP　22　sshd               │
+│ TCP　8766　python3          │
+│ UDP　68　dhclient           │
+│ …                          │
+└────────────────────────────┘
 ```
 
-点击顶栏区域展开详情：GPU 型号、显存绝对值（GB）、CPU 封装功耗与 GPU 功耗拆分。点击右侧 `PORTS` 展开监听端口列表（协议、端口、进程名）。
+点击顶栏区域展开详情：GPU 型号、显存绝对值（GB）、CPU 封装功耗与 GPU 功耗拆分。端口面板每 2 秒自动刷新，无需点击。
 
 ## 数据来源
 
@@ -100,7 +109,8 @@ sudo rm /etc/tmpfiles.d/systatus-powercap.conf
 - 刷新间隔：`extension.js` 中 `REFRESH_SECONDS`（默认 2 秒）
 - 指标顺序与颜色：`_init()` 中的段落数组与 `COLORS`
 - 标签语言：`_render()` 中各 `set_text` 前缀
-- 端口指示器透明度：`PORTS_OPACITY`（0 全透明 ~ 255 不透明，默认 150）
+- 端口面板背景透明度：`PORTS_BG_OPACITY`（0 全透明 ~ 255 不透明，默认 140）
+- 端口面板宽度：`PORTS_WIDTH`（px，默认 280）
 
 ## 卸载
 

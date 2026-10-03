@@ -2,7 +2,10 @@ import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import GObject from 'gi://GObject';
+import Pango from 'gi://Pango';
 import St from 'gi://St';
+
+import Meta from 'gi://Meta';
 
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -13,7 +16,8 @@ const REFRESH_SECONDS = 2;
 const NVIDIA_SMI = '/usr/bin/nvidia-smi';
 const RAPL_PKG = '/sys/class/powercap/intel-rapl:0/energy_uj';
 const RAPL_MAX = '/sys/class/powercap/intel-rapl:0/max_energy_range_uj';
-const PORTS_OPACITY = 150; // 端口指示器顶栏不透明度（0 全透明 ~ 255 不透明）
+const PORTS_BG_OPACITY = 140; // 端口面板背景不透明度（0 全透明 ~ 255 不透明）
+const PORTS_WIDTH = 280; // 端口面板宽度（px）
 
 const COLORS = {
     cpu: '#42a5f5',
@@ -342,29 +346,43 @@ class Indicator extends PanelMenuButton {
     }
 });
 
-// 面板右侧的监听端口指示器：顶栏半透明显示端口数量，点击展开端口/进程列表。
-const PortsIndicator = GObject.registerClass(
-class PortsIndicator extends PanelMenuButton {
+// 桌面右侧常驻的监听端口面板：半透明背景，直接列出所有监听端口（协议/端口/进程名）。
+// 挂在 global.overlay 的 NORMAL 层之下（layerBelow），即桌面层级：
+// 常驻可见，但位于普通窗口之下，不遮挡窗口。
+const PortsOverlay = GObject.registerClass(
+class PortsOverlay {
     _init() {
-        super._init(0.0, '监听端口', false);
+        this._rows = [];
 
-        this._ports = [];
-        this._items = [];
+        // 根节点铺满整个舞台，本身透明、不拦截事件；
+        // 面板用 halign/valign 定位到右上角（顶栏下方）。
+        this._root = new St.Widget({ hexpand: true, vexpand: true });
+        const alpha = (PORTS_BG_OPACITY / 255).toFixed(3);
+        this._panel = new St.BoxLayout({
+            vertical: true,
+            halign: Clutter.ActorAlign.END,
+            valign: Clutter.ActorAlign.START,
+        });
+        this._panel.set_width(PORTS_WIDTH);
+        this._panel.set_margin_top(48);
+        this._panel.set_margin_right(16);
+        this._panel.set_style(
+            `background-color: rgba(15, 17, 21, ${alpha});` +
+            ' border-radius: 10px;' +
+            ' padding: 10px 12px;',
+        );
+        this._root.add_child(this._panel);
 
-        const box = new St.BoxLayout({ style_class: 'panel-status-menu-box' });
-        const dot = new St.Label({ text: '● ', y_align: Clutter.ActorAlign.CENTER });
-        dot.set_style(`color: ${COLORS.ports};`);
-        this._label = new St.Label({ text: 'PORTS –', y_align: Clutter.ActorAlign.CENTER });
-        box.add_child(dot);
-        box.add_child(this._label);
-        box.set_opacity(PORTS_OPACITY);
-        this.add_child(box);
+        this._header = new St.Label({ text: 'PORTS', x_align: Pango.Alignment.LEFT });
+        this._header.set_style(`font-weight: bold; color: ${COLORS.ports};`);
+        this._panel.add_child(this._header);
 
-        const itemParams = { reactive: false, can_focus: false };
-        this._header = new PopupMenuItem('', itemParams);
-        this._sep = new PopupSeparatorMenuItem();
-        this.menu.addMenuItem(this._sep);
-        this.menu.addMenuItem(this._header);
+        this._list = new St.BoxLayout({ vertical: true });
+        this._panel.add_child(this._list);
+
+        this._more = new St.Label({ text: '', x_align: Pango.Alignment.LEFT });
+        this._more.set_style('font-family: monospace;');
+        this._panel.add_child(this._more);
 
         this._tickId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, REFRESH_SECONDS, () => {
             this._tick();
@@ -378,7 +396,7 @@ class PortsIndicator extends PanelMenuButton {
             GLib.source_remove(this._tickId);
             this._tickId = null;
         }
-        super.destroy();
+        this._root.destroy();
     }
 
     _tick() {
@@ -401,45 +419,55 @@ class PortsIndicator extends PanelMenuButton {
             name: s.inode && s.inode !== '0' ? owners.get(s.inode) : null,
         }));
         list.sort((a, b) => a.proto === b.proto ? a.port - b.port : (a.proto < b.proto ? -1 : 1));
-        this._ports = list;
-        this._render();
+        this._render(list);
     }
 
-    _render() {
-        const n = this._ports.length;
-        this._label.set_text(`PORTS ${n}`);
-        const visible = Math.min(n, 100);
-        while (this._items.length < visible)
-            this._items.push(new PopupMenuItem('', { reactive: false, can_focus: false }));
-        for (let i = 0; i < visible; i++) {
-            const p = this._ports[i];
-            this._items[i].label_actor.text = `${p.proto}　${p.port}${p.name ? `　${p.name}` : ''}`;
+    _render(list) {
+        const n = list.length;
+        this._header.set_text(n ? `PORTS　${n} 个监听端口` : 'PORTS　无监听端口');
+        // 按屏幕高度限制可见行数，超出部分折叠为一行提示
+        const maxRows = Math.max(10, Math.floor((global.screen_height - 160) / 22));
+        const visible = Math.min(n, maxRows);
+        while (this._rows.length < visible) {
+            const row = new St.Label({ x_align: Pango.Alignment.LEFT });
+            row.set_style('font-family: monospace;');
+            this._list.add_child(row);
+            this._rows.push(row);
         }
-        this._header.label_actor.text = n ? `PORTS　${n} 个监听端口` : 'PORTS　无监听端口';
-        this.menu.removeAll();
-        this.menu.addMenuItem(this._sep);
-        this.menu.addMenuItem(this._header);
-        for (let i = 0; i < visible; i++)
-            this.menu.addMenuItem(this._items[i]);
+        for (let i = this._rows.length - 1; i >= visible; i--) {
+            this._list.remove_child(this._rows[i]);
+            this._rows[i].destroy();
+            this._rows.pop();
+        }
+        for (let i = 0; i < visible; i++) {
+            const p = list[i];
+            this._rows[i].set_text(`${p.proto}　${p.port}${p.name ? `　${p.name}` : ''}`);
+        }
+        this._more.visible = n > visible;
+        if (n > visible)
+            this._more.set_text(`… 还有 ${n - visible} 个`);
     }
 });
 
 export default class SystatusExtension extends Extension {
     enable() {
         this._indicator = new Indicator();
-        this._portsIndicator = new PortsIndicator();
         // 挂到面板左侧（Activities 之后），避开居中的日期时间。
         // 必须走 addToStatusArea：它插入的是 indicator.container，
         // 直接 add_child(button) 会宽度塌陷、什么都不显示。
         Main.panel.addToStatusArea(this.uuid, this._indicator, 1, 'left');
-        // 端口指示器挂面板右侧，半透明显示。
-        Main.panel.addToStatusArea(this.uuid + '-ports', this._portsIndicator, 0, 'right');
+        // 端口面板：桌面右侧常驻半透明覆盖层（窗口之下）。
+        this._portsOverlay = new PortsOverlay();
+        global.overlay.add_actor(this._portsOverlay._root, {
+            layer: Meta.Layer.NORMAL,
+            layerBelow: true,
+        });
     }
 
     disable() {
         this._indicator?.destroy();
         this._indicator = null;
-        this._portsIndicator?.destroy();
-        this._portsIndicator = null;
+        this._portsOverlay?.destroy();
+        this._portsOverlay = null;
     }
 }

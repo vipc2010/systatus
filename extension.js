@@ -2,10 +2,7 @@ import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import GObject from 'gi://GObject';
-import Pango from 'gi://Pango';
 import St from 'gi://St';
-
-import Meta from 'gi://Meta';
 
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -18,6 +15,25 @@ const RAPL_PKG = '/sys/class/powercap/intel-rapl:0/energy_uj';
 const RAPL_MAX = '/sys/class/powercap/intel-rapl:0/max_energy_range_uj';
 const PORTS_BG_OPACITY = 140; // 端口面板背景不透明度（0 全透明 ~ 255 不透明）
 const PORTS_WIDTH = 280; // 端口面板宽度（px）
+const PORTS_REFRESH_SECONDS = 5; // 端口列表刷新间隔（每秒 fork 一次 ss，没必要跟主指标同频）
+// 手工别名：自动认出来的单元名/进程名不够直观时用它覆盖。键 = "proto:port"（proto 小写）。
+// 从 ~/.config/systatus/aliases.json 读取，形如 {"tcp:3000": "myservice"}。
+// 文件只存在于本机、不进仓库；每次刷新端口列表时重读，改完即生效。
+const ALIASES_FILE = GLib.build_filenamev([GLib.get_user_config_dir(), 'systatus', 'aliases.json']);
+function loadAliases() {
+    const map = new Map();
+    const txt = readText(ALIASES_FILE);
+    if (!txt)
+        return map;
+    try {
+        for (const [k, v] of Object.entries(JSON.parse(txt)))
+            map.set(k, String(v));
+    } catch (e) {
+        log(`解析 ${ALIASES_FILE} 失败：${e.message}`);
+    }
+    return map;
+}
+const SS_BIN = '/usr/bin/ss'; // iproute2，端口与进程名的数据来源
 
 const COLORS = {
     cpu: '#42a5f5',
@@ -26,6 +42,7 @@ const COLORS = {
     vram: '#26c6da',
     pwr: '#ef5350',
     ports: '#ab47bc',
+    text: '#f2f3f5', // 端口面板正文色：背景是近黑半透明，必须显式覆盖主题的深色字
 };
 
 function readText(path) {
@@ -49,83 +66,91 @@ function fmtGb(mib) {
     return (mib / 1024).toFixed(1);
 }
 
-// 读取监听端口：TCP 只取 st=0A（LISTEN），UDP 取所有已绑定套接字。
-// 返回 [{proto: 'tcp'|'udp', port, inode}]
-function readListeningSockets() {
-    const sockets = [];
-    const sources = [
-        ['/proc/net/tcp', 'tcp', true],
-        ['/proc/net/tcp6', 'tcp', true],
-        ['/proc/net/udp', 'udp', false],
-        ['/proc/net/udp6', 'udp', false],
-    ];
-    for (const [path, proto, listenOnly] of sources) {
-        const txt = readText(path);
-        if (!txt)
-            continue;
-        const lines = txt.split('\n');
-        for (let i = 1; i < lines.length; i++) {
-            const f = lines[i].trim().split(/\s+/);
-            if (f.length < 10)
-                continue;
-            if (listenOnly && f[3] !== '0A')
-                continue;
-            const port = parseInt(f[1].split(':').pop(), 16);
-            if (port > 0)
-                sockets.push({ proto, port, inode: f[9] });
+// ss -tulnpe 的一行 = 一个 socket：
+//   Netid State Recv-Q Send-Q Local:Port Peer:Port [users:(..)] [uid:..] ino:.. sk:.. cgroup:.. ...
+// users: 只对同 uid 的进程可见，但 cgroup: 对所有 socket 都可见，因此别人的端口可以用
+// systemd 单元名来认（/system.slice/redis-server.service → redis-server）。
+let _uidNames = null;
+function uidName(uid) {
+    if (_uidNames === null) {
+        _uidNames = new Map();
+        const txt = readText('/etc/passwd');
+        if (txt) {
+            for (const line of txt.split('\n')) {
+                const f = line.split(':');
+                if (f.length > 2 && f[2])
+                    _uidNames.set(f[2], f[0]);
+            }
         }
     }
-    return sockets;
+    return _uidNames.get(uid) ?? null;
 }
 
-// 通过 /proc/<pid>/fd 的 socket:[inode] 符号链接反查进程名（仅当前用户可见的进程）。
-// 返回 Map<inode, comm>
-function findSocketOwners(inodes) {
-    const owners = new Map();
-    if (inodes.size === 0)
-        return owners;
-    const procEnum = GLib.file_enumerate_directory(GLib.file_new_for_path('/proc'), GLib.PRIORITY_DEFAULT, null);
-    if (!procEnum)
-        return owners;
-    outer:
-    while (true) {
-        const entry = procEnum.next_file(procEnum);
-        if (!entry)
-            break;
-        const pid = entry.get_name();
-        if (!/^\d+$/.test(pid))
-            continue;
-        const fdEnum = GLib.file_enumerate_directory(GLib.file_new_for_path(`/proc/${pid}/fd`), GLib.PRIORITY_DEFAULT, null);
-        if (!fdEnum)
-            continue;
-        while (true) {
-            const fdEntry = fdEnum.next_file(fdEnum);
-            if (!fdEntry)
-                break;
-            let target = null;
-            try {
-                target = Gio.File.new_for_path(`/proc/${pid}/fd/${fdEntry.get_name()}`).read_symlink();
-            } catch (e) {
-                continue;
-            }
-            if (!target || !target.startsWith('socket:['))
-                continue;
-            const inode = target.slice(8, -1);
-            if (inodes.has(inode) && !owners.has(inode)) {
-                const comm = readText(`/proc/${pid}/comm`);
-                owners.set(inode, comm ? comm.trim().split('\n')[0] : pid);
-                if (owners.size === inodes.size) {
-                    fdEnum.close();
-                    procEnum.close();
-                    break outer;
-                }
-            }
-        }
-        fdEnum.close();
-    }
-    procEnum.close();
-    return owners;
+// cgroup 路径 → 单元名；认不出（user@1000.service、init.scope 这类容器路径）返回 null。
+function unitNameFromCgroup(cg) {
+    const last = cg.split('/').filter(Boolean).pop() || '';
+    // 图形程序：.../app.slice/app-qoder-1218855.scope → qoder
+    let m = last.match(/^app-([a-zA-Z0-9._+-]+)-[0-9a-f]{7,}\.(scope|slice)$/);
+    if (m)
+        return m[1];
+    m = last.match(/^(.+?)\.(service|socket|scope|mount|slice)$/);
+    if (!m)
+        return null;
+    if (/^(user@\d+|init|app|session|system)$/.test(m[1]))
+        return null;
+    return m[1];
 }
+
+// 返回 [显示名, 可信度]：进程名(自己) > systemd 单元名 > uid 用户名 > 无名
+function socketLabel(line) {
+    const m = line.match(/users:\(\("([^"]+)"/);
+    if (m)
+        return [m[1], 3];
+    const cg = line.match(/\bcgroup:(\S+)/);
+    if (cg) {
+        const unit = unitNameFromCgroup(cg[1]);
+        if (unit)
+            return [unit, 2];
+    }
+    const uid = line.match(/\buid:(\d+)/);
+    if (uid) {
+        const name = uidName(uid[1]);
+        if (name)
+            return [name, 1];
+    }
+    return [null, 0];
+}
+
+function parseSocketList(text, aliases) {
+    const byKey = new Map();
+    if (!text)
+        return byKey;
+    for (const line of text.split('\n')) {
+        const f = line.trim().split(/\s+/);
+        if (f.length < 6)
+            continue;
+        const [proto, state, , , local] = f;
+        if (proto !== 'tcp' && proto !== 'udp')
+            continue;
+        if (proto === 'tcp' && state !== 'LISTEN')
+            continue;
+        const port = parseInt(local.slice(local.lastIndexOf(':') + 1), 10);
+        if (!port)
+            continue;
+        const [name, rank] = socketLabel(line);
+        const key = `${proto}:${port}`;
+        const alias = aliases.get(key);
+        const shown = alias ?? name;
+        const reliability = alias ? 4 : rank;
+        const prev = byKey.get(key);
+        // 同一端口 v4/v6 各一行：取可信度高的那个名字
+        if (!prev || reliability > prev.rank)
+            byKey.set(key, {proto: proto.toUpperCase(), port, name: shown, rank: reliability});
+    }
+    return byKey;
+}
+
+
 
 const Indicator = GObject.registerClass(
 class Indicator extends PanelMenuButton {
@@ -140,6 +165,7 @@ class Indicator extends PanelMenuButton {
         this._gpu = null;
         this._gpuName = null;
         this._gpuBusy = false;
+        this._dead = false;
         this._hasSmi = GLib.file_test(NVIDIA_SMI, GLib.FileTest.EXISTS);
 
         const box = new St.BoxLayout({ style_class: 'panel-status-menu-box' });
@@ -178,6 +204,7 @@ class Indicator extends PanelMenuButton {
     }
 
     destroy() {
+        this._dead = true;
         if (this._tickId) {
             GLib.source_remove(this._tickId);
             this._tickId = null;
@@ -309,6 +336,9 @@ class Indicator extends PanelMenuButton {
     }
 
     _render() {
+        // nvidia-smi 回调回来时扩展可能已被禁用，别再碰已销毁的 actor
+        if (this._dead)
+            return;
         this._labels.cpu.set_text(`CPU ${fmtPct(this._cpuPct)}`);
         this._labels.mem.set_text(`RAM ${fmtPct(this._mem?.pct)}`);
         this._labels.gpu.set_text(`GPU ${this._hasSmi ? fmtPct(this._gpu?.util) : '无'}`);
@@ -346,52 +376,89 @@ class Indicator extends PanelMenuButton {
     }
 });
 
-// 桌面右侧常驻的监听端口面板：半透明背景，直接列出所有监听端口（协议/端口/进程名）。
-// 挂在 global.overlay 的 NORMAL 层之下（layerBelow），即桌面层级：
-// 常驻可见，但位于普通窗口之下，不遮挡窗口。
-const PortsOverlay = GObject.registerClass(
+// 桌面右侧的监听端口面板：半透明背景，列出所有监听端口（协议/端口/进程名）。
+// 贴在桌面层（global.window_group 里壁纸组之上、所有应用窗口之下）：
+// 窗口一挡就看不见，只有露出桌面壁纸时才看得到，不遮挡任何应用。
+// 根节点透明且不拦截事件，面板之外的区域照常点击。
 class PortsOverlay {
-    _init() {
+    constructor() {
         this._rows = [];
+        this._busy = false;
+        this._dead = false;
 
-        // 根节点铺满整个舞台，本身透明、不拦截事件；
-        // 面板用 halign/valign 定位到右上角（顶栏下方）。
-        this._root = new St.Widget({ hexpand: true, vexpand: true });
-        const alpha = (PORTS_BG_OPACITY / 255).toFixed(3);
-        this._panel = new St.BoxLayout({
-            vertical: true,
-            halign: Clutter.ActorAlign.END,
-            valign: Clutter.ActorAlign.START,
+        // 根节点用约束铺满 uiGroup（chrome 父节点 set_no_layout，不会自动分配子节点）。
+        // 布局用 FixedLayout + 显式坐标：BinLayout 的 x_align 语义在这里不奏效（实测面板会居中）。
+        this._root = new St.Widget({
+            name: 'systatus-ports',
+            layout_manager: new Clutter.FixedLayout(),
+            constraints: new Clutter.BindConstraint({
+                source: Main.layoutManager.uiGroup,
+                coordinate: Clutter.BindCoordinate.ALL,
+            }),
         });
+        const alpha = (PORTS_BG_OPACITY / 255).toFixed(3);
+        this._panel = new St.BoxLayout({vertical: true});
         this._panel.set_width(PORTS_WIDTH);
-        this._panel.set_margin_top(48);
-        this._panel.set_margin_right(16);
         this._panel.set_style(
             `background-color: rgba(15, 17, 21, ${alpha});` +
+            ' border: 1px solid rgba(255, 255, 255, 0.12);' +
             ' border-radius: 10px;' +
             ' padding: 10px 12px;',
         );
         this._root.add_child(this._panel);
 
-        this._header = new St.Label({ text: 'PORTS', x_align: Pango.Alignment.LEFT });
+        this._header = new St.Label({ text: 'PORTS', x_align: Clutter.ActorAlign.START });
         this._header.set_style(`font-weight: bold; color: ${COLORS.ports};`);
         this._panel.add_child(this._header);
 
         this._list = new St.BoxLayout({ vertical: true });
         this._panel.add_child(this._list);
 
-        this._more = new St.Label({ text: '', x_align: Pango.Alignment.LEFT });
-        this._more.set_style('font-family: monospace;');
+        this._more = new St.Label({ text: '', x_align: Clutter.ActorAlign.START });
+        this._more.set_style(`font-family: monospace; color: ${COLORS.text};`);
         this._panel.add_child(this._more);
 
-        this._tickId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, REFRESH_SECONDS, () => {
+        this._place();
+        this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => this._place());
+        this._pinToDesktopLayer();
+
+        this._tickId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, PORTS_REFRESH_SECONDS, () => {
             this._tick();
             return GLib.SOURCE_CONTINUE;
         });
         this._tick();
     }
 
+    // 右上角定位：顶栏下方 48px，右边留 16px
+    _place() {
+        const monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor)
+            return;
+        this._panel.set_position(monitor.width - PORTS_WIDTH - 16, monitor.y + 48);
+    }
+
+    // 钉在壁纸之上、窗口之下。mutter 每次重排窗口栈都可能把别的 actor 插到我们前面，
+    // 所以每次刷新检查一次；已在位时什么都不做。
+    // _backgroundGroup 是 GNOME 50 实测存在的壁纸锚点（window_group 的第 0 个子节点）。
+    _pinToDesktopLayer() {
+        const wg = global.window_group;
+        const kids = wg.get_children();
+        if (kids[1] === this._root)
+            return;
+        const anchor = Main.layoutManager._backgroundGroup || kids[0];
+        if (!anchor || anchor === this._root)
+            return;
+        if (!kids.includes(this._root))
+            wg.add_child(this._root);
+        wg.set_child_above_sibling(this._root, anchor);
+    }
+
     destroy() {
+        this._dead = true;
+        if (this._monitorsChangedId) {
+            Main.layoutManager.disconnect(this._monitorsChangedId);
+            this._monitorsChangedId = null;
+        }
         if (this._tickId) {
             GLib.source_remove(this._tickId);
             this._tickId = null;
@@ -400,26 +467,48 @@ class PortsOverlay {
     }
 
     _tick() {
-        const sockets = readListeningSockets();
-        // 同一 proto:port 可能在 v4/v6 各出现一次，去重
-        const byKey = new Map();
-        for (const s of sockets) {
-            const key = `${s.proto}:${s.port}`;
-            if (!byKey.has(key))
-                byKey.set(key, s);
-        }
-        const inodes = new Set();
-        for (const s of byKey.values())
-            if (s.inode && s.inode !== '0')
-                inodes.add(s.inode);
-        const owners = findSocketOwners(inodes);
-        const list = [...byKey.values()].map(s => ({
-            proto: s.proto.toUpperCase(),
-            port: s.port,
-            name: s.inode && s.inode !== '0' ? owners.get(s.inode) : null,
-        }));
-        list.sort((a, b) => a.proto === b.proto ? a.port - b.port : (a.proto < b.proto ? -1 : 1));
-        this._render(list);
+        this._pinToDesktopLayer();
+        if (this._busy || !GLib.file_test(SS_BIN, GLib.FileTest.EXISTS))
+            return;
+        this._busy = true;
+        this._runSs().then(text => {
+            this._busy = false;
+            // 查询回来时扩展可能已被禁用，别再碰已销毁的 actor
+            if (this._dead)
+                return;
+            const list = [...parseSocketList(text, loadAliases()).values()];
+            // 先按服务名分组，让同一个服务的一批端口挨在一起；同服务内先 TCP 后 UDP、端口由小到大
+            list.sort((a, b) => {
+                const an = a.name ?? '', bn = b.name ?? '';
+                if (an !== bn) {
+                    if (!an)
+                        return 1;
+                    if (!bn)
+                        return -1;
+                    return an.localeCompare(bn);
+                }
+                return a.proto === b.proto ? a.port - b.port : (a.proto < b.proto ? -1 : 1);
+            });
+            this._render(list);
+        });
+    }
+
+    _runSs() {
+        return new Promise(resolve => {
+            const proc = new Gio.Subprocess({
+                argv: [SS_BIN, '-tulnpe'],
+                flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE,
+            });
+            proc.init(null);
+            proc.communicate_async(null, null, (obj, res) => {
+                try {
+                    const [, out] = obj.communicate_finish(res);
+                    resolve(out ? new TextDecoder().decode(out.get_data()) : null);
+                } catch (e) {
+                    resolve(null);
+                }
+            });
+        });
     }
 
     _render(list) {
@@ -429,8 +518,8 @@ class PortsOverlay {
         const maxRows = Math.max(10, Math.floor((global.screen_height - 160) / 22));
         const visible = Math.min(n, maxRows);
         while (this._rows.length < visible) {
-            const row = new St.Label({ x_align: Pango.Alignment.LEFT });
-            row.set_style('font-family: monospace;');
+            const row = new St.Label({ x_align: Clutter.ActorAlign.START });
+            row.set_style(`font-family: monospace; color: ${COLORS.text};`);
             this._list.add_child(row);
             this._rows.push(row);
         }
@@ -447,7 +536,7 @@ class PortsOverlay {
         if (n > visible)
             this._more.set_text(`… 还有 ${n - visible} 个`);
     }
-});
+}
 
 export default class SystatusExtension extends Extension {
     enable() {
@@ -456,12 +545,8 @@ export default class SystatusExtension extends Extension {
         // 必须走 addToStatusArea：它插入的是 indicator.container，
         // 直接 add_child(button) 会宽度塌陷、什么都不显示。
         Main.panel.addToStatusArea(this.uuid, this._indicator, 1, 'left');
-        // 端口面板：桌面右侧常驻半透明覆盖层（窗口之下）。
+        // 端口面板：自己挂到桌面层（见 PortsOverlay._pinToDesktopLayer）
         this._portsOverlay = new PortsOverlay();
-        global.overlay.add_actor(this._portsOverlay._root, {
-            layer: Meta.Layer.NORMAL,
-            layerBelow: true,
-        });
     }
 
     disable() {

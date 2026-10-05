@@ -377,8 +377,7 @@ class Indicator extends PanelMenuButton {
 });
 
 // 桌面右侧的监听端口面板：半透明背景，列出所有监听端口（协议/端口/进程名）。
-// 贴在桌面层（global.window_group 里壁纸组之上、所有应用窗口之下）：
-// 窗口一挡就看不见，只有露出桌面壁纸时才看得到，不遮挡任何应用。
+// 贴在壁纸组（_backgroundGroup）内部：永远在所有应用窗口之下，只有露出桌面壁纸时才看得见。
 // 根节点透明且不拦截事件，面板之外的区域照常点击。
 class PortsOverlay {
     constructor() {
@@ -419,8 +418,11 @@ class PortsOverlay {
         this._panel.add_child(this._more);
 
         this._place();
-        this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => this._place());
-        this._pinToDesktopLayer();
+        this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => {
+            this._place();
+            this._pinToWallpaperLayer();
+        });
+        this._pinToWallpaperLayer();
 
         this._tickId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, PORTS_REFRESH_SECONDS, () => {
             this._tick();
@@ -437,20 +439,19 @@ class PortsOverlay {
         this._panel.set_position(monitor.width - PORTS_WIDTH - 16, monitor.y + 48);
     }
 
-    // 钉在壁纸之上、窗口之下。mutter 每次重排窗口栈都可能把别的 actor 插到我们前面，
-    // 所以每次刷新检查一次；已在位时什么都不做。
-    // _backgroundGroup 是 GNOME 50 实测存在的壁纸锚点（window_group 的第 0 个子节点）。
-    _pinToDesktopLayer() {
-        const wg = global.window_group;
-        const kids = wg.get_children();
-        if (kids[1] === this._root)
+    // 钉在壁纸层：挂进 _backgroundGroup 内部，而不是挂在 window_group 上。
+    // window_group 由 mutter 按窗口栈排序，我们这种没有 meta window 的 actor 会被抬到最前面，
+    // 于是新窗口一打开面板就先盖到窗口上、等下一次刷新才退回桌面。
+    // _backgroundGroup 是 Shell 在 layout.js 里永久压到 window_group 最底的壁纸组，
+    // 组内只有各显示器的壁纸 actor，用 z_position 压在壁纸之上即可，不用跟窗口抢顺序。
+    _pinToWallpaperLayer() {
+        const bg = Main.layoutManager._backgroundGroup;
+        if (!bg || bg.get_parent() !== global.window_group)
             return;
-        const anchor = Main.layoutManager._backgroundGroup || kids[0];
-        if (!anchor || anchor === this._root)
-            return;
-        if (!kids.includes(this._root))
-            wg.add_child(this._root);
-        wg.set_child_above_sibling(this._root, anchor);
+        if (this._root.get_parent() !== bg)
+            bg.add_child(this._root);
+        // 壁纸 actor 的 z_position 都是 0，压过它们即可；组内没有窗口，不用担心排序被抢
+        this._root.set_z_position(1);
     }
 
     destroy() {
@@ -467,7 +468,7 @@ class PortsOverlay {
     }
 
     _tick() {
-        this._pinToDesktopLayer();
+        this._pinToWallpaperLayer();
         if (this._busy || !GLib.file_test(SS_BIN, GLib.FileTest.EXISTS))
             return;
         this._busy = true;
@@ -545,7 +546,7 @@ export default class SystatusExtension extends Extension {
         // 必须走 addToStatusArea：它插入的是 indicator.container，
         // 直接 add_child(button) 会宽度塌陷、什么都不显示。
         Main.panel.addToStatusArea(this.uuid, this._indicator, 1, 'left');
-        // 端口面板：自己挂到桌面层（见 PortsOverlay._pinToDesktopLayer）
+        // 端口面板：自己挂到壁纸组（见 PortsOverlay._pinToWallpaperLayer）
         this._portsOverlay = new PortsOverlay();
     }
 
